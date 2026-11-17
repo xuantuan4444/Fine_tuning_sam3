@@ -1,16 +1,17 @@
-# Copy to paths.yaml (git-ignored) and edit. Relative paths are relative to this yaml file.
-# Values below = the H200 server layout used by full_pipeline (/datastore/dungmt/full_pipeline).
+# Copy to paths.yaml (git-ignored) and edit if your data is elsewhere.
+# Relative paths are relative to this yaml file. Defaults = the layout of README.md section 2
+# (data downloaded and unzipped into data/, sam3.pt in weights/).
 
 # VOC2012: the folder that holds JPEGImages/, SegmentationClass/, SegmentationObject/, ImageSets/Segmentation/
-voc_root: /datastore/dungmt/full_pipeline/voc/data/VOC2012
+voc_root: ./data/VOC2012
 
 # Cityscapes: leftImg8bit/ holds train/<city>/*_leftImg8bit.png and val/...;
 #             gtFine/ holds train/<city>/*_gtFine_labelIds.png AND *_gtFine_instanceIds.png, val/...
-cityscapes_leftImg8bit: /datastore/dungmt/full_pipeline/cityscapes/data/cityscapes/leftImg8bit
-cityscapes_gtFine: /datastore/dungmt/full_pipeline/cityscapes/data/cityscapes/gtFine
+cityscapes_leftImg8bit: ./data/data_cityscapes/leftImg8bit_trainvaltest/leftImg8bit
+cityscapes_gtFine: ./data/data_cityscapes/gtFine_trainvaltest/gtFine
 
 # official SAM3 image checkpoint (sha256 9999e234...c8c9e, checked in step 0)
-sam3_checkpoint: /datastore/dungmt/full_pipeline/weights/sam3.pt
+sam3_checkpoint: ./weights/sam3.pt
 
 # everything is written here (about 10 GB at the end, mostly val raw); created if missing
 out_root: ./outputs
