@@ -1,0 +1,19 @@
+# Copy to paths.yaml (git-ignored) and edit. Relative paths are relative to this yaml file.
+# Values below = the H200 server layout used by full_pipeline (/datastore/dungmt/full_pipeline).
+
+# VOC2012: the folder that holds JPEGImages/, SegmentationClass/, SegmentationObject/, ImageSets/Segmentation/
+voc_root: /datastore/dungmt/full_pipeline/voc/data/VOC2012
+
+# Cityscapes: leftImg8bit/ holds train/<city>/*_leftImg8bit.png and val/...;
+#             gtFine/ holds train/<city>/*_gtFine_labelIds.png AND *_gtFine_instanceIds.png, val/...
+cityscapes_leftImg8bit: /datastore/dungmt/full_pipeline/cityscapes/data/cityscapes/leftImg8bit
+cityscapes_gtFine: /datastore/dungmt/full_pipeline/cityscapes/data/cityscapes/gtFine
+
+# official SAM3 image checkpoint (sha256 9999e234...c8c9e, checked in step 0)
+sam3_checkpoint: /datastore/dungmt/full_pipeline/weights/sam3.pt
+
+# everything is written here (about 10 GB at the end, mostly val raw); created if missing
+out_root: ./outputs
+
+device: cuda          # cuda on the server; cpu only for local code tests
+num_workers: 4        # dataloader workers (the template's 10 risks the RAM kill -9)

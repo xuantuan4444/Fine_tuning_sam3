@@ -1,0 +1,26 @@
+# private notes (progress / decisions of the thesis): local only
+thongtin_finetuning.md
+
+# machine-specific settings
+paths.yaml
+.env
+*.env
+
+# outputs, weights, data, archives
+outputs*/
+*.pt
+*.pth
+*.npz
+*.zip
+*.log
+data/
+weights/
+
+# Python / editor noise
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv*/
+.vscode/
+.idea/
