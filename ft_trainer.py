@@ -54,7 +54,7 @@ class FtTrainer(Trainer):
         self._steps_mark = 0
         super().__init__(**kwargs)
         self.ds, self.cfg = self.ft["dataset"], self.ft["config"]
-        self.paths = fc.load_paths(self.ft["paths_yaml"])
+        self.paths = fc.load_paths(self.ft["paths_yaml"], [self.ft["dataset"]])
         self.paths["out_root"] = self.ft["out_root"]
         self.sp = fc.spec(self.ds)
         _, hold = self.sp.split_train()
@@ -118,7 +118,7 @@ class FtTrainer(Trainer):
                     "sam3_sha256": fc.SAM3_CKPT_SHA256, "code_version": fc.CODE_VERSION}
             ft_model.save_best(model, fc.model_file(self.paths, self.ds, self.cfg, "best.pt"), meta)
             fc.save_npz_atomic(fc.model_file(self.paths, self.ds, self.cfg, "holdout_conf_tau.npz"),
-                               ids=np.array(self.holdout_ids), taus=fc.TAUS, conf=res["conf_tau"].astype(np.int32),
+                               ids=np.array(self.holdout_ids), taus=fc.TAUS, conf=res["conf_tau"].astype(np.int32, copy=False),
                                label_names=np.array(self.sp.names), epoch=np.int32(epoch))
             hist["best_epoch"], hist["best_score"] = epoch, score
         if hist["ref_score"] is None or score > hist["ref_score"] + fc.MIN_GAIN:

@@ -10,10 +10,17 @@ voc_root: ./data/VOC2012
 cityscapes_leftImg8bit: ./data/data_cityscapes/leftImg8bit_trainvaltest/leftImg8bit
 cityscapes_gtFine: ./data/data_cityscapes/gtFine_trainvaltest/gtFine
 
+# PASCAL-Context 59 (only for run_finetune_pc59.py; the main job ignores it): the folder holding
+# JPEGImages/ (VOC2010 images), SegmentationClassContext/ (<id>.png: 0 = background, 1..59 = classes),
+# pascal_context_train.txt (4998 lines), pascal_context_val.txt (5105 lines). Default = VOC2010.zip unzipped
+# into data/, with the other three items added inside it (README section 4.1)
+pc59_root: ./data/VOC2010
+
 # official SAM3 image checkpoint (sha256 9999e234...c8c9e, checked in step 0)
 sam3_checkpoint: ./weights/sam3.pt
 
-# everything is written here (about 10 GB at the end, mostly val raw); created if missing
+# everything is written here (about 10 GB at the end, mostly val raw); created if missing.
+# The PC59 job writes to <out_root>/pc59/ (about 40 GB at the end, mostly val raw)
 out_root: ./outputs
 
 device: cuda          # cuda on the server; cpu only for local code tests

@@ -14,6 +14,7 @@ Steps (killed? run the SAME command again: finished steps are skipped, a model i
                the best checkpoint at tau_A chosen on holdout (ft_eval.py --mode val), then pack
   6 summary    sam3ft_summary.csv + sam3ft_results_pack.zip (small files to send back)
 The pack is rebuilt after every model, so results of finished models are never lost.
+PASCAL-Context 59 is a separate job: run_finetune_pc59.py (outputs in <out_root>/pc59/, not in this pack).
 """
 from __future__ import annotations
 
@@ -116,15 +117,15 @@ def ckpt_sha(paths):
     return cache["sha256"]
 
 
-def count_files(paths, rn):
+def count_files(paths, rn, datasets=fc.MAIN_DATASETS):
     out, problems = {}, []
-    v, c = fc.spec("voc2012"), fc.spec("cityscapes")
-    for sp in (v, c):
+    for sp in [fc.spec(ds) for ds in datasets]:
         for split in ("train", "val"):
             ids = sp.list_ids(paths, split)                      # raises if the count is wrong
             miss_img = [i for i in ids if not sp.image_path(paths, split, i).exists()]
             gts = [sp.gt_paths(paths, split, i) for i in ids]
-            keys = list(gts[0].keys()) if split == "train" else (["cls"] if sp.name == "voc2012" else ["label"])
+            # train needs every GT file (objects); val only the class map (first key)
+            keys = list(gts[0].keys()) if split == "train" else list(gts[0].keys())[:1]
             miss_gt = {k: sum(not g[k].exists() for g in gts) for k in keys}
             out[f"{sp.name}_{split}"] = {"images": len(ids), "missing_images": len(miss_img), "missing_gt": miss_gt}
             if miss_img:
@@ -137,7 +138,7 @@ def count_files(paths, rn):
     return out, problems
 
 
-def step_checks(paths, rn, smoke):
+def step_checks(paths, rn, smoke, datasets=fc.MAIN_DATASETS, disk_min=DISK_MIN_GB):
     rn.banner("STEP 0: checks")
     rep, problems = {"python": sys.version.split()[0], "platform": platform.platform(), "time": fc.now()}, []
     for mod in ("torch", "torchvision", "numpy", "scipy", "pycocotools", "hydra", "omegaconf", "submitit", "fvcore",
@@ -177,15 +178,16 @@ def step_checks(paths, rn, smoke):
     rep["sam3_sha256"] = sha
     if sha != fc.SAM3_CKPT_SHA256:
         problems.append(f"sha256 of {paths['sam3_checkpoint']} = {sha} != {fc.SAM3_CKPT_SHA256} (another checkpoint?)")
-    for ds in ("voc2012", "cityscapes"):
+    for ds in datasets:
         fc.spec(ds).split_train()
-        fc.need(fc.ASSETS_DIR / f"{ds}_ref_pred" / "ref_meta.json", "reference predictions")
-    rep["files"], p2 = count_files(paths, rn)
+        if ds in fc.MAIN_DATASETS:                               # Kaggle run-1 references exist for these two
+            fc.need(fc.ASSETS_DIR / f"{ds}_ref_pred" / "ref_meta.json", "reference predictions")
+    rep["files"], p2 = count_files(paths, rn, datasets)
     problems += p2
     du = shutil.disk_usage(Path(paths["out_root"]))
     rep["disk_free_gb"] = du.free / 2**30
-    if du.free / 2**30 < DISK_MIN_GB and not smoke:
-        problems.append(f"only {du.free / 2**30:.0f} GB free at {paths['out_root']} (need >= {DISK_MIN_GB} GB)")
+    if du.free / 2**30 < disk_min and not smoke:
+        problems.append(f"only {du.free / 2**30:.0f} GB free at {paths['out_root']} (need >= {disk_min} GB)")
     fc.save_json_atomic(Path(paths["out_root"]) / "checks.json", rep)
     for k, v in rep.items():
         if k != "files":
@@ -200,12 +202,12 @@ def step_checks(paths, rn, smoke):
 # ----------------------------------------------------------------------------------------------
 # Step 2: preflight
 # ----------------------------------------------------------------------------------------------
-def derived_yaml(paths, out_root, name):
-    """paths.yaml with another out_root (COCO files still read from the main out_root)."""
+def derived_yaml(paths, out_root, name, coco_root=None):
+    """paths.yaml with another out_root (COCO files still read from the main out_root unless coco_root)."""
     import yaml
-    d = {k: paths[k] for k in fc.PATH_KEYS}
+    d = {k: paths[k] for k in fc.PATH_KEYS if paths.get(k)}
     d.update(out_root=str(out_root), device=paths["device"], num_workers=paths["num_workers"],
-             coco_root=paths.get("coco_root") or str(Path(paths["out_root"]) / "data_coco"))
+             coco_root=str(coco_root or paths.get("coco_root") or Path(paths["out_root"]) / "data_coco"))
     p = Path(out_root) / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(yaml.safe_dump(d, sort_keys=False), encoding="utf-8")
@@ -260,7 +262,7 @@ def step_preflight(paths, rn):
     est, total = {}, 0.0
     for ds, cfg in fc.MODEL_ORDER:
         sp = fc.spec(ds)
-        n_fit, n_hold = (1171, 293) if ds == "voc2012" else (2380, 595)
+        n_fit, n_hold = (len(x) for x in sp.split_train())
         cap = fc.EPOCH_CAP[ds]
         s_img = speed[cfg]["s_per_holdout_image"] * (sp.C / 19)
         h_cap = (cap * n_fit * speed[cfg]["s_per_step"] + cap * n_hold * s_img + sp.n_val * s_img * 1.3) / 3600
@@ -289,7 +291,12 @@ def model_done(paths, ds, cfg, fp):
     return d is not None and d.get("fingerprint") == fp
 
 
-def step_model(paths, rn, ds, cfg, limits):
+def finish_main(paths, rn):
+    write_summary(paths)
+    pack(paths, rn)
+
+
+def step_model(paths, rn, ds, cfg, limits, finish=finish_main):
     import ft_train
     fp = ft_train.train_fingerprint(paths, ds, cfg, limits.get("fit_limit"), limits.get("holdout_limit"),
                                     limits.get("epoch_cap"))
@@ -309,13 +316,12 @@ def step_model(paths, rn, ds, cfg, limits):
     rep = fc.load_json(fc.model_file(paths, ds, cfg, "val_report.json"))
     fc.save_json_atomic(fc.model_file(paths, ds, cfg, "done.json"),
                         {"fingerprint": fp, "val_miou_at_tau_A": rep["miou_at_tau_A"], "tau_A": rep["tau_A"], "finished": fc.now()})
-    write_summary(paths)
-    pack(paths, rn)
+    finish(paths, rn)
 
 
-def write_summary(paths):
+def write_summary(paths, models=fc.MODEL_ORDER, csv_name="sam3ft_summary.csv"):
     rows = []
-    for ds, cfg in fc.MODEL_ORDER:
+    for ds, cfg in models:
         best = fc.load_json(fc.model_file(paths, ds, cfg, "best.json"))
         if best is None:
             continue
@@ -330,7 +336,7 @@ def write_summary(paths):
                      "train_and_holdout_hours": td.get("hours_train_and_holdout"),
                      "val_hours": (rep.get("seconds") or 0) / 3600 or None, "status": "done" if rep else "training"})
     if rows:
-        f = Path(paths["out_root"]) / "sam3ft_summary.csv"
+        f = Path(paths["out_root"]) / csv_name
         with open(f, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(rows[0]))
             w.writeheader()
@@ -342,16 +348,19 @@ PACK_SUFFIXES = (".json", ".csv", ".yaml", ".log", ".txt")
 PACK_NPZ = ("holdout_conf_tau.npz", "val_conf_tau.npz")
 
 
-def pack(paths, rn):
-    """Small files only (no .pt, no raw/pred folders, no tensorboard): the part to send back."""
+def pack(paths, rn, zip_name="sam3ft_results_pack.zip", skip_top=("pc59",)):
+    """Small files only (no .pt, no raw/pred folders, no tensorboard): the part to send back.
+    skip_top: top-level folders left out (the main pack leaves out pc59/, which has its own pack)."""
     root = Path(paths["out_root"])
-    out = root / "sam3ft_results_pack.zip"
+    out = root / zip_name
     tmp = out.with_name(out.name + ".tmp")
     n = 0
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
         for p in sorted(root.rglob("*")):
             rel = p.relative_to(root)
             parts = set(rel.parts)
+            if rel.parts[0] in skip_top:
+                continue
             if not p.is_file() or any(x.endswith(("_val_raw", "_val_pred", "_resume", "tensorboard")) for x in parts):
                 continue
             if "runs" in rel.parts[:2] or p.name.endswith((".tmp", ".zip")) or "fit_coco" in p.name:
@@ -364,16 +373,18 @@ def pack(paths, rn):
 
 
 # ----------------------------------------------------------------------------------------------
-def plan(paths, smoke, models):
+def plan(paths, smoke, models, datasets=fc.MAIN_DATASETS, preflight_done=None):
     import ft_prepare_data
     import ft_train
     lim = SMOKE if smoke else {}
     rows = [("0 checks", "always")]
     rows.append(("1 prepare", " ".join(f"{ds}:{'done' if ft_prepare_data.is_done(paths, ds) else 'TODO'}"
-                                      for ds in ("cityscapes", "voc2012"))))
+                                      for ds in datasets)))
     if not smoke:
-        r = fc.load_json(Path(paths["out_root"]) / "preflight" / "preflight_report.json") or {}
-        rows.append(("2 preflight", "done" if r.get("passed") and r.get("fingerprint") == preflight_fp() else "TODO"))
+        if preflight_done is None:
+            r = fc.load_json(Path(paths["out_root"]) / "preflight" / "preflight_report.json") or {}
+            preflight_done = bool(r.get("passed") and r.get("fingerprint") == preflight_fp())
+        rows.append(("2 preflight", "done" if preflight_done else "TODO"))
     for ds, cfg in models:
         fp = ft_train.train_fingerprint(paths, ds, cfg, lim.get("fit_limit"), lim.get("holdout_limit"), lim.get("epoch_cap"))
         if model_done(paths, ds, cfg, fp):
@@ -384,7 +395,7 @@ def plan(paths, smoke, models):
             h = fc.load_json(fc.model_file(paths, ds, cfg, "holdout_history.json"))
             st = f"training resumes after epoch {max(map(int, h['epochs']))}" if h and h["epochs"] else "TODO"
         rows.append((f"  {ds} {cfg}", st))
-    rows.append(("6 summary + pack", "always"))
+    rows.append(("last: summary + pack", "always"))
     return rows
 
 

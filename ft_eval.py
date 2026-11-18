@@ -11,7 +11,10 @@ Masks are ranked once by score, so ONE pass gives the confusion matrix at every 
 
 Modes (CLI):
   val        : model <ds>_<cfg>_best.pt on the whole val split, at tau_A chosen on holdout;
-               writes raw (run-1 format), pred PNG, conf_tau, report.
+               writes raw (run-1 format; VOC/City only) or a small per-image confusion file (PC59, no raw),
+               pred PNG, conf_tau, report.
+  base_val   : SAM3 as released on the whole val split (BL0; PC59 job): pred PNG at 0.5, per-image confusion,
+               conf_tau, report with mIoU at 0.5 and at every tau (no tau is chosen on val).
   preflight  : SAM3 as released on the 50 reference holdout images (assets/<ds>_ref_pred) -> agreement
                with the Kaggle run-1 prediction (environment check + hardware noise).
   reload     : best checkpoint reloaded from disk == model in memory (holdout images of the history).
@@ -210,16 +213,23 @@ def _loader(sp, paths, split, ids, workers=2):
             yield from ex.map(load, ids[k:k + 8])
 
 
-def evaluate(infer, sp, paths, split, ids, desc, raw_dir=None, pred_dir=None, pred_tau=None, ref_dir=None):
-    """Run the model on ids. Returns dict(conf_tau [N, NT, K, K] int64, ids, seconds, [agree])."""
+def evaluate(infer, sp, paths, split, ids, desc, raw_dir=None, pred_dir=None, pred_tau=None, ref_dir=None,
+             conf_dir=None):
+    """Run the model on ids. Returns dict(conf_tau [N, NT, K, K] int32 per image, ids, seconds, [agree]).
+    raw_dir : per-image raw .npz (run-1 format + conf_tau); resume reads conf_tau from it.
+    conf_dir: per-image <id>.npz holding only conf_tau (no raw); resume reads it. One of the two at most.
+    The per-image file is written last (after the pred PNG), so its presence means the image is complete."""
     from PIL import Image
     from tqdm import tqdm
+    assert not (raw_dir and conf_dir), "raw_dir and conf_dir are exclusive"
     dev = infer.device
-    conf_tau = np.zeros((len(ids), fc.NT, sp.K, sp.K), np.int64)
+    # per-image counts (<= pixels of one image) fit int32: PC59 val 5105 x 14 x 60 x 60 is 1 GB instead of 2 GB
+    conf_tau = np.zeros((len(ids), fc.NT, sp.K, sp.K), np.int32)
     agree, npix, t0 = 0, 0, time.time()
     todo = []
+    done_dir = raw_dir or conf_dir
     for n, i in enumerate(ids):
-        rp = Path(raw_dir) / f"{i}.npz" if raw_dir else None
+        rp = Path(done_dir) / f"{i}.npz" if done_dir else None
         pp = Path(pred_dir) / f"{i}.png" if pred_dir else None
         if rp is not None and rp.exists() and (pp is None or pp.exists()):
             with np.load(rp) as z:                         # resume: image already done
@@ -247,7 +257,9 @@ def evaluate(infer, sp, paths, split, ids, desc, raw_dir=None, pred_dir=None, pr
         if raw_dir is not None:
             raw = dict(r["raw"], conf=ct[fc.J_BASE], conf_tau=ct, time_s=np.float32(r["time_s"]))
             fc.save_npz_atomic(Path(raw_dir) / f"{i}.npz", **raw)
-    out = {"conf_tau": conf_tau, "ids": list(ids), "seconds": time.time() - t0, "n_run": len(todo)}
+        if conf_dir is not None:
+            fc.save_npz_atomic(Path(conf_dir) / f"{i}.npz", conf_tau=ct.astype(np.int32))
+    out ={"conf_tau": conf_tau, "ids": list(ids), "seconds": time.time() - t0, "n_run": len(todo)}
     if ref_dir is not None:
         out["agree"] = agree / max(npix, 1)
     return out
@@ -255,7 +267,7 @@ def evaluate(infer, sp, paths, split, ids, desc, raw_dir=None, pred_dir=None, pr
 
 def summarize(conf_tau, sp):
     """conf_tau [N, NT, K, K] -> mIoU per tau, chosen tau (rule of tau*), per-class IoU."""
-    tot = conf_tau.sum(0)
+    tot = conf_tau.sum(0, dtype=np.int64)
     m = [fc.miou(tot[j], sp) for j in range(fc.NT)]
     j = fc.choose_tau(m)
     return {"miou_by_tau": m, "tau_index": j, "tau": float(fc.TAUS[j]), "miou": m[j], "miou_0.5": m[fc.J_BASE],
@@ -278,23 +290,55 @@ def mode_val(paths, ds, cfg, limit=None):
     model, meta = ft_model.build_eval_model(cfg, paths["sam3_checkpoint"], best_pt, device=dev)
     assert meta["epoch"] == best["epoch"], (meta, best)
     infer = Sam3Infer(model, dev, sp.prompts)
+    save_raw = fc.VAL_SAVE_RAW[ds]                        # VOC/City: raw as before; PC59: per-image conf only
     res = evaluate(infer, sp, paths, "val", ids, f"{ds} {cfg} val",
-                   raw_dir=fc.model_file(paths, ds, cfg, "val_raw"), pred_dir=fc.model_file(paths, ds, cfg, "val_pred"),
-                   pred_tau=float(fc.TAUS[tau_j]))
+                   raw_dir=fc.model_file(paths, ds, cfg, "val_raw") if save_raw else None,
+                   conf_dir=None if save_raw else fc.model_file(paths, ds, cfg, "val_conf"),
+                   pred_dir=fc.model_file(paths, ds, cfg, "val_pred"), pred_tau=float(fc.TAUS[tau_j]))
     s = summarize(res["conf_tau"], sp)
     fc.save_npz_atomic(fc.model_file(paths, ds, cfg, "val_conf_tau.npz"), ids=np.array(ids), taus=fc.TAUS,
-                       conf=res["conf_tau"].astype(np.int32), label_names=np.array(sp.names))
+                       conf=res["conf_tau"].astype(np.int32, copy=False), label_names=np.array(sp.names))
     report = {"dataset": ds, "config": cfg, "split": "val", "n_images": len(ids), "limit": limit,
               "tau_A": float(fc.TAUS[tau_j]), "tau_A_from": "holdout (best.json)", "best_epoch": best["epoch"],
               "miou_at_tau_A": s["miou_by_tau"][tau_j], "miou_at_0.5": s["miou_0.5"],
               "miou_by_tau": dict(zip(map(str, fc.TAU_GRID), s["miou_by_tau"])),
-              "iou_at_tau_A": dict(zip(sp.names, fc.per_label_iou(res["conf_tau"].sum(0)[tau_j]).tolist())),
+              "iou_at_tau_A": dict(zip(sp.names, fc.per_label_iou(res["conf_tau"].sum(0, dtype=np.int64)[tau_j]).tolist())),
               "iou_at_0.5": s["iou_at_0.5"], "eval_idx": sp.eval_idx,
               "note_val_best_tau": "tau maximising val mIoU is NOT used for anything (val is looked at once)",
               "seconds": res["seconds"], "raw_format": RAW_FORMAT, "created": fc.now()}
+    if not save_raw:
+        del report["raw_format"]
+        report["val_raw"] = "not saved (Q-P3); per-image confusion in val_conf/<id>.npz (conf_tau int32 [NT, K, K])"
     fc.save_json_atomic(fc.model_file(paths, ds, cfg, "val_report.json"), report)
     fc.log(f"{ds} {cfg} val: mIoU {report['miou_at_tau_A']:.4f} at tau_A={report['tau_A']} "
            f"({report['miou_at_0.5']:.4f} at 0.5), {len(ids)} images")
+    return report
+
+
+def mode_base_val(paths, ds, limit=None):
+    """SAM3 as released on val (BL0 at 0.5, the setting of the SAM3 paper). One pass also gives the mIoU at every
+    tau of the grid, reported as a curve only: no tau is chosen on val. No raw, per-image confusion for resume."""
+    import ft_model
+    sp, cfg = fc.spec(ds), fc.BASE_CFG
+    ids = sp.list_ids(paths, "val")[:limit] if limit else sp.list_ids(paths, "val")
+    dev = "cuda" if paths["device"] == "cuda" else "cpu"
+    model, _ = ft_model.build_eval_model("base", paths["sam3_checkpoint"], device=dev)
+    infer = Sam3Infer(model, dev, sp.prompts)
+    res = evaluate(infer, sp, paths, "val", ids, f"{ds} SAM3 base val",
+                   conf_dir=fc.model_file(paths, ds, cfg, "val_conf"), pred_dir=fc.model_file(paths, ds, cfg, "val_pred"),
+                   pred_tau=fc.BASE_THR)
+    s = summarize(res["conf_tau"], sp)
+    fc.save_npz_atomic(fc.model_file(paths, ds, cfg, "val_conf_tau.npz"), ids=np.array(ids), taus=fc.TAUS,
+                       conf=res["conf_tau"].astype(np.int32, copy=False), label_names=np.array(sp.names))
+    report = {"dataset": ds, "config": cfg, "model": "SAM3 as released (sam3.pt, no fine-tuning)", "split": "val",
+              "n_images": len(ids), "limit": limit, "threshold": fc.BASE_THR, "miou_at_0.5": s["miou_0.5"],
+              "miou_by_tau": dict(zip(map(str, fc.TAU_GRID), s["miou_by_tau"])), "iou_at_0.5": s["iou_at_0.5"],
+              "eval_idx": sp.eval_idx, "prompts": sp.prompts,
+              "note": "BL0 = Sam3Processor default threshold 0.5. miou_by_tau is a curve only: no tau is chosen on val.",
+              "val_raw": "not saved; per-image confusion in val_conf/<id>.npz (conf_tau int32 [NT, K, K])",
+              "seconds": res["seconds"], "created": fc.now()}
+    fc.save_json_atomic(fc.model_file(paths, ds, cfg, "val_report.json"), report)
+    fc.log(f"{ds} SAM3 base val: mIoU {report['miou_at_0.5']:.4f} at 0.5, {len(ids)} images")
     return report
 
 
@@ -384,17 +428,19 @@ def mode_rawcheck(paths, ds, raw_dir, max_images=None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", required=True, choices=["val", "preflight", "reload", "rawcheck"])
+    ap.add_argument("--mode", required=True, choices=["val", "base_val", "preflight", "reload", "rawcheck"])
     ap.add_argument("--paths", required=True)
-    ap.add_argument("--dataset", required=True, choices=["voc2012", "cityscapes"])
+    ap.add_argument("--dataset", required=True, choices=list(fc.DATASETS))
     ap.add_argument("--cfg", choices=list(fc.FT_CONFIGS))
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--out-json", default=None)
     ap.add_argument("--raw-dir", default=None, help="rawcheck: Method-B run-1 folder holding raw/, pred/, meta.json")
     args = ap.parse_args()
-    paths = fc.load_paths(args.paths)
+    paths = fc.load_paths(args.paths, [args.dataset])
     if args.mode == "val":
         mode_val(paths, args.dataset, args.cfg, args.limit)
+    elif args.mode == "base_val":
+        mode_base_val(paths, args.dataset, args.limit)
     elif args.mode == "preflight":
         mode_preflight(paths, args.dataset, args.out_json, args.limit)
     elif args.mode == "reload":

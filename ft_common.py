@@ -1,4 +1,4 @@
-"""Shared definitions for Method A (fine-tuning SAM3 on VOC 2012 / Cityscapes).
+"""Shared definitions for Method A (fine-tuning SAM3 on VOC 2012 / Cityscapes, and PASCAL-Context 59).
 
 Everything that is specific to a dataset (classes, prompts, label space, file layout) lives in
 DATASET SPEC below. Every other file imports it from here, so train / holdout / val all use the
@@ -8,6 +8,9 @@ Label space for evaluation (identical to Method B):
   VOC : 0 = background (also what an un-predicted pixel becomes), 1..20 = classes, 255 = void;
         mIoU over the 21 labels.
   City: 0 = no prediction (counts as a miss), 1..19 = trainId + 1, 255 = ignore; mIoU over 19 classes.
+  PC59: 0 = no prediction (counts as a miss), 1..59 = classes in alphabetical order (= the PNG value of
+        SegmentationClassContext), PNG 0 (background / the ~400 other Context classes) -> 255 = ignore;
+        mIoU over 59 classes (= mmsegmentation PascalContextDataset59, reduce_zero_label).
 """
 from __future__ import annotations
 
@@ -45,7 +48,9 @@ RING_RADIUS = 2                         # context ring for raw features (backbon
 MASK_CHUNK = 32                         # masks upsampled at a time
 
 # Training schedule (decided 17/11): early stopping on holdout mIoU
-EPOCH_CAP = {"voc2012": 12, "cityscapes": 6}   # ~14k steps each (VOC 12 x 1171, City 6 x 2380)
+EPOCH_CAP = {"voc2012": 12, "cityscapes": 6,   # ~14k steps each (VOC 12 x 1171, City 6 x 2380)
+             "pc59": 4}                         # PC59 4 x 3998 = 16k steps (3 epochs would leave early
+                                                # stopping no room: it needs 1 + PATIENCE epochs)
 PATIENCE = 2                            # stop after 2 epochs without a significant gain
 MIN_GAIN = 0.001                        # significant gain = +0.1 mIoU point on holdout
 SEED = 0
@@ -53,11 +58,20 @@ SEED = 0
 # Label conversion for training (decided 17/11)
 VOID_FILL_PX = 3                        # VOC void <= 3 px from a labelled pixel takes its label
 CITY_MIN_PIECE = 64                     # City pole/light/sign pieces < 64 px join the nearest piece
+PC59_MIN_PIECE = 64                     # PC59 "thing" pieces < 64 px join the nearest piece (same rule)
 MAX_OBJ_PER_QUERY = 200                 # repo filter FilterFindQueriesWithTooManyOut (max_ann_per_img)
 
 # Order of the models in the single job = priority order (decided 17/11: A2 first, A1 last)
 MODEL_ORDER = [("cityscapes", "A2"), ("voc2012", "A2"), ("voc2012", "A1"), ("cityscapes", "A1")]
 FT_CONFIGS = ("A2", "A1")
+MAIN_DATASETS = ("cityscapes", "voc2012")             # run_finetune.py
+PC59_MODEL_ORDER = [("pc59", "A2"), ("pc59", "A1")]   # run_finetune_pc59.py (separate job, decided 18/11)
+DATASETS = ("voc2012", "cityscapes", "pc59")
+# val outputs (Q-P3, decided 18/11): VOC/City keep the per-image raw .npz (run-1 format, error analysis, resume);
+# PC59 keeps no raw (16-21 GB per model, not needed: val only reports the fine-tune result) but a small per-image
+# confusion file <ds>_<cfg>_val_conf/<id>.npz instead, so an interrupted val resumes. val_pred/ is kept everywhere.
+VAL_SAVE_RAW = {"voc2012": True, "cityscapes": True, "pc59": False}
+BASE_CFG = "base"                       # SAM3 as released on val at 0.5 (BL0), PC59 job only (Q-P1, decided 18/11)
 
 # ----------------------------------------------------------------------------------------------
 # DATASET SPEC
@@ -84,6 +98,26 @@ CITY_INSTANCE_LABELIDS = {24, 25, 26, 27, 28, 31, 32, 33}   # person rider car t
 CITY_THING_NO_INSTANCE_LABELIDS = {17, 19, 20}               # pole, traffic light, traffic sign
 # all other evaluated classes are regions ("stuff"): one mask per class per image
 
+# PASCAL-Context 59 (VOC2010 images). ABSOLUTE RULE: alphabetical order = mmsegmentation
+# PascalContextDataset59 = value v of SegmentationClassContext/<id>.png is PC59_CLASSES[v - 1].
+# Never derive it from 59_labels.txt (that file lists the 20 VOC classes first). Checked 18/11 on 400
+# VOC2010 images: each of the 20 VOC classes of SegmentationClass falls on its alphabetical index.
+PC59_CLASSES = ["aeroplane", "bag", "bed", "bedclothes", "bench", "bicycle", "bird", "boat", "book", "bottle",
+                "building", "bus", "cabinet", "car", "cat", "ceiling", "chair", "cloth", "computer", "cow", "cup",
+                "curtain", "dog", "door", "fence", "floor", "flower", "food", "grass", "ground", "horse",
+                "keyboard", "light", "motorbike", "mountain", "mouse", "person", "plate", "platform",
+                "pottedplant", "road", "rock", "sheep", "shelves", "sidewalk", "sign", "sky", "snow", "sofa",
+                "table", "track", "train", "tree", "truck", "tvmonitor", "wall", "water", "window", "wood"]
+# prompts: class names; the two glued VOC names are split into words as for VOC (finding of Method B)
+PC59_PROMPTS = [{"pottedplant": "potted plant", "tvmonitor": "tv monitor"}.get(c, c) for c in PC59_CLASSES]
+# PC59 has no instance ids. "Things" (countable objects: the 20 VOC classes + bag bed bench book computer cup
+# keyboard mouse plate sign truck) -> one object per 8-connected piece (pieces < PC59_MIN_PIECE px join the
+# nearest piece), as City pole / light / sign. Every other class is a region ("stuff"): one mask per class.
+PC59_THINGS = ["aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow", "table", "dog",
+               "horse", "motorbike", "person", "pottedplant", "sheep", "sofa", "train", "tvmonitor",
+               "bag", "bed", "bench", "book", "computer", "cup", "keyboard", "mouse", "plate", "sign", "truck"]
+assert len(PC59_CLASSES) == 59 and PC59_CLASSES == sorted(PC59_CLASSES) and set(PC59_THINGS) <= set(PC59_CLASSES)
+
 
 class DatasetSpec:
     def __init__(self, name):
@@ -98,8 +132,13 @@ class DatasetSpec:
             self.K, self.zero_name = 20, "no_prediction"
             self.eval_idx = list(range(1, 20))
             self.n_train, self.n_val = 2975, 500
+        elif name == "pc59":
+            self.classes, self.prompts = PC59_CLASSES, PC59_PROMPTS
+            self.K, self.zero_name = 60, "no_prediction"
+            self.eval_idx = list(range(1, 60))
+            self.n_train, self.n_val = 4998, 5105
         else:
-            raise ValueError(f"unknown dataset {name!r}; expected voc2012 or cityscapes")
+            raise ValueError(f"unknown dataset {name!r}; expected one of {DATASETS}")
         self.C = len(self.classes)
         self.names = [self.zero_name] + self.classes
         assert len(self.prompts) == self.C and self.K == self.C + 1
@@ -109,10 +148,14 @@ class DatasetSpec:
         """Folder the COCO file_name is relative to."""
         if self.name == "voc2012":
             return Path(paths["voc_root"]) / "JPEGImages"
+        if self.name == "pc59":
+            return Path(paths["pc59_root"]) / "JPEGImages"
         return Path(paths["cityscapes_leftImg8bit"]) / split
 
     def rel_image(self, img_id):
-        return f"{img_id}.jpg" if self.name == "voc2012" else f"{img_id.split('_')[0]}/{img_id}_leftImg8bit.png"
+        if self.name in ("voc2012", "pc59"):
+            return f"{img_id}.jpg"
+        return f"{img_id.split('_')[0]}/{img_id}_leftImg8bit.png"
 
     def image_path(self, paths, split, img_id):
         return self.img_folder(paths, split) / self.rel_image(img_id)
@@ -121,6 +164,8 @@ class DatasetSpec:
         if self.name == "voc2012":
             r = Path(paths["voc_root"])
             return {"cls": r / "SegmentationClass" / f"{img_id}.png", "obj": r / "SegmentationObject" / f"{img_id}.png"}
+        if self.name == "pc59":
+            return {"cls": Path(paths["pc59_root"]) / "SegmentationClassContext" / f"{img_id}.png"}
         d = Path(paths["cityscapes_gtFine"]) / split / img_id.split("_")[0]
         return {"label": d / f"{img_id}_gtFine_labelIds.png", "inst": d / f"{img_id}_gtFine_instanceIds.png"}
 
@@ -130,15 +175,23 @@ class DatasetSpec:
         g = self.gt_paths(paths, split, img_id)
         if self.name == "voc2012":
             return np.array(Image.open(g["cls"]), dtype=np.uint8)
+        if self.name == "pc59":
+            raw = load_pc59_png(g["cls"])
+            return np.where(raw == 0, 255, raw).astype(np.uint8)
         train_id = CITY_LUT[np.array(Image.open(g["label"]), dtype=np.uint8)]
         return np.where(train_id == 255, 255, train_id + 1).astype(np.uint8)
 
     def list_ids(self, paths, split):
-        """All image ids of a split, sorted (train = 1464 / 2975, val = 1449 / 500)."""
+        """All image ids of a split, sorted (train = 1464 / 2975 / 4998, val = 1449 / 500 / 5105)."""
         if self.name == "voc2012":
             lst = Path(paths["voc_root"]) / "ImageSets" / "Segmentation" / f"{split}.txt"
             need(lst, f"VOC {split} list")
             ids = sorted(x.strip() for x in lst.read_text().splitlines() if x.strip())
+        elif self.name == "pc59":
+            # one line per image: 'JPEGImages/<id>.jpg GroundTruth_trainval_png/<id>.png'
+            lst = Path(paths["pc59_root"]) / f"pascal_context_{split}.txt"
+            need(lst, f"PC59 {split} list")
+            ids = sorted(Path(x.split()[0]).stem for x in lst.read_text().splitlines() if x.strip())
         else:
             d = Path(paths["cityscapes_gtFine"]) / split
             need(d, f"Cityscapes gtFine/{split}")
@@ -162,6 +215,16 @@ def spec(name) -> DatasetSpec:
     return DatasetSpec(name)
 
 
+def load_pc59_png(path):
+    """SegmentationClassContext PNG: 0 = background (other Context classes), v in 1..59 = PC59_CLASSES[v-1]."""
+    from PIL import Image
+    raw = np.array(Image.open(path), dtype=np.uint8)
+    if raw.ndim != 2 or raw.max() > 59:
+        raise PipelineError(f"{path}: not a PC59 label map (shape {raw.shape}, max {raw.max()}); "
+                            f"expected values 0..59 (SegmentationClassContext)")
+    return raw
+
+
 # ----------------------------------------------------------------------------------------------
 # paths.yaml
 # ----------------------------------------------------------------------------------------------
@@ -169,22 +232,29 @@ PATH_KEYS = {
     "voc_root": "folder holding JPEGImages/, SegmentationClass/, SegmentationObject/, ImageSets/Segmentation/",
     "cityscapes_leftImg8bit": "Cityscapes folder holding train/<city>/*_leftImg8bit.png and val/...",
     "cityscapes_gtFine": "Cityscapes folder holding train/<city>/*_gtFine_{labelIds,instanceIds}.png and val/...",
+    "pc59_root": "PC59 folder holding JPEGImages/ (VOC2010), SegmentationClassContext/, pascal_context_{train,val}.txt",
     "sam3_checkpoint": "sam3.pt (the official SAM3 image checkpoint)",
     "out_root": "output folder (created if missing)",
 }
+CORE_PATH_KEYS = ("sam3_checkpoint", "out_root")
+DATASET_PATH_KEYS = {"voc2012": ("voc_root",), "cityscapes": ("cityscapes_leftImg8bit", "cityscapes_gtFine"),
+                     "pc59": ("pc59_root",)}
 
 
-def load_paths(yaml_path):
+def load_paths(yaml_path, datasets=MAIN_DATASETS):
+    """Read paths.yaml. Required: sam3_checkpoint, out_root and the keys of `datasets` (the main run needs
+    VOC + Cityscapes, the PC59 run only pc59_root). Every known key that is present is resolved."""
     import yaml
     p = Path(yaml_path)
     need(p, "paths file (copy paths.example.yaml to paths.yaml and edit it)")
     cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    missing = [k for k in PATH_KEYS if not cfg.get(k)]
+    required = list(CORE_PATH_KEYS) + [k for ds in datasets for k in DATASET_PATH_KEYS[ds]]
+    missing = [k for k in required if not cfg.get(k)]
     if missing:
-        raise PipelineError(f"{p}: missing keys {missing}. Expected:\n" + "\n".join(f"  {k}: {v}" for k, v in PATH_KEYS.items()))
+        raise PipelineError(f"{p}: missing keys {missing}. Expected:\n" + "\n".join(f"  {k}: {PATH_KEYS[k]}" for k in required))
     base = p.resolve().parent
     out = dict(cfg)
-    for k in PATH_KEYS:                      # relative paths are relative to the yaml file
+    for k in [k for k in PATH_KEYS if cfg.get(k)]:   # relative paths are relative to the yaml file
         q = Path(os.path.expanduser(str(cfg[k])))
         out[k] = str(q if q.is_absolute() else (base / q).resolve())
     out.setdefault("device", "cuda")

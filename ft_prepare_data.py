@@ -1,6 +1,6 @@
 """Step 1: ground truth -> COCO json + RLE masks for the TRAIN-FIT images (the only images SAM3 trains on).
 
-  python ft_prepare_data.py --paths paths.yaml [--datasets cityscapes voc2012] [--check]
+  python ft_prepare_data.py --paths paths.yaml [--datasets cityscapes voc2012 | pc59] [--check]
 
 Output: <out_root>/data_coco/<ds>_fit_coco.json, <ds>_fit_stats.json, samples/<ds>_*.png
 
@@ -18,6 +18,12 @@ Objects:
          nearest piece >= 64 px (all pieces form one object if none is that large).
          road sidewalk building wall fence vegetation terrain sky -> one mask per class per image.
          trainId 255 pixels belong to no object (negative for every query); eval still ignores them.
+  PC59 : no instance ids. "Things" (ft_common.PC59_THINGS: the 20 VOC classes + 11 countable objects) ->
+         8-connected pieces of the class, pieces < 64 px join the nearest piece >= 64 px (as City pole);
+         if a class still has > 200 pieces in an image it becomes one object (the repo would drop the query).
+         Other classes ("stuff": wall, sky, grass, ...) -> one mask per class per image.
+         Background (PNG 0 = the ~400 other Context classes) belongs to no object (negative for every
+         query); eval ignores it.
 Every image is checked: objects are disjoint, each labelled pixel belongs to exactly one object of its
 class, every RLE decodes back to its mask, bbox/area match the mask.
 """
@@ -44,8 +50,11 @@ def coco_paths(paths, ds):
 def prepare_fingerprint(paths, ds):
     sp = fc.spec(ds)
     fit, _ = sp.split_train()
-    return fc.fingerprint({"v": PREPARE_VERSION, "ds": ds, "fit": fit, "prompts": sp.prompts,
-                           "void_px": fc.VOID_FILL_PX, "min_piece": fc.CITY_MIN_PIECE})
+    d = {"v": PREPARE_VERSION, "ds": ds, "fit": fit, "prompts": sp.prompts,
+         "void_px": fc.VOID_FILL_PX, "min_piece": fc.CITY_MIN_PIECE}
+    if ds == "pc59":
+        d.update(min_piece=fc.PC59_MIN_PIECE, things=fc.PC59_THINGS, max_obj=fc.MAX_OBJ_PER_QUERY)
+    return fc.fingerprint(d)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -86,10 +95,30 @@ def voc_objects(cls, obj):
     return objects, cls_f, stats
 
 
+def split_pieces(cm, min_piece, stats):
+    """8-connected pieces of the bool mask cm; pieces < min_piece px join the nearest piece >= min_piece px
+    (all pieces form one object if none is that large). -> list of bool masks (disjoint, union = cm)."""
+    from scipy import ndimage
+    comp, n = ndimage.label(cm, structure=np.ones((3, 3), bool))
+    sizes = np.bincount(comp.ravel(), minlength=n + 1)
+    big = [k for k in range(1, n + 1) if sizes[k] >= min_piece]
+    stats["pieces"] += n
+    if not big:
+        stats["merged_pieces"] += max(n - 1, 0)
+        return [cm]
+    if len(big) < n:
+        big_map = np.where(np.isin(comp, big), comp, 0)
+        _, (iy, ix) = ndimage.distance_transform_edt(big_map == 0, return_indices=True)
+        small = cm & (big_map == 0)
+        big_map[small] = big_map[iy[small], ix[small]]
+        comp = big_map
+        stats["merged_pieces"] += n - len(big)
+    return [comp == k for k in big]
+
+
 def city_objects(label_ids, inst_ids):
     """label_ids uint8, inst_ids int32 [H, W] (*_gtFine_labelIds.png, *_gtFine_instanceIds.png).
     -> (objects [(label 1..19, bool mask)], eval label map, stats)"""
-    from scipy import ndimage
     train_id = fc.CITY_LUT[label_ids]
     lab = np.where(train_id == 255, 0, train_id + 1).astype(np.uint8)     # 0 = no object here
     objects, stats = [], {"merged_pieces": 0, "pieces": 0}
@@ -107,26 +136,31 @@ def city_objects(label_ids, inst_ids):
                     raise fc.PipelineError(f"region value {v} inside labelId {lid}")
                 objects.append((c, cm & (inst_ids == v)))
         elif lid in fc.CITY_THING_NO_INSTANCE_LABELIDS:
-            comp, n = ndimage.label(cm, structure=np.ones((3, 3), bool))
-            sizes = np.bincount(comp.ravel(), minlength=n + 1)
-            big = [k for k in range(1, n + 1) if sizes[k] >= fc.CITY_MIN_PIECE]
-            stats["pieces"] += n
-            if not big:
-                objects.append((c, cm))
-                stats["merged_pieces"] += max(n - 1, 0)
-                continue
-            if len(big) < n:
-                big_map = np.where(np.isin(comp, big), comp, 0)
-                _, (iy, ix) = ndimage.distance_transform_edt(big_map == 0, return_indices=True)
-                small = cm & (big_map == 0)
-                big_map[small] = big_map[iy[small], ix[small]]
-                comp = big_map
-                stats["merged_pieces"] += n - len(big)
-            for k in big:
-                objects.append((c, comp == k))
+            objects += [(c, m) for m in split_pieces(cm, fc.CITY_MIN_PIECE, stats)]
         else:
             objects.append((c, cm))
     return objects, lab, stats
+
+
+PC59_THING_LABELS = {fc.PC59_CLASSES.index(c) + 1 for c in fc.PC59_THINGS}
+
+
+def pc59_objects(raw):
+    """raw uint8 [H, W] (SegmentationClassContext: 0 = background, v = PC59_CLASSES[v-1]).
+    -> (objects [(label 1..59, bool mask)], label map (0 = no object), stats)"""
+    objects = []
+    stats = {"merged_pieces": 0, "pieces": 0, "one_mask_fallback": 0, "background": int((raw == 0).sum())}
+    for c in np.unique(raw[raw > 0]).tolist():
+        cm = raw == c
+        if c in PC59_THING_LABELS:
+            ps = split_pieces(cm, fc.PC59_MIN_PIECE, stats)
+            if len(ps) > fc.MAX_OBJ_PER_QUERY:              # FilterFindQueriesWithTooManyOut would drop the query
+                stats["one_mask_fallback"] += 1
+                ps = [cm]
+            objects += [(c, m) for m in ps]
+        else:
+            objects.append((c, cm))
+    return objects, raw, stats
 
 
 # ----------------------------------------------------------------------------------------------
@@ -166,6 +200,8 @@ def process_image(job):
         obj = np.array(Image.open(g["obj"]), np.uint8)
         assert cls.shape == obj.shape
         objects, lab, st = voc_objects(cls, obj)
+    elif ds == "pc59":
+        objects, lab, st = pc59_objects(fc.load_pc59_png(g["cls"]))
     else:
         label_ids = np.array(Image.open(g["label"]), np.uint8)
         inst_ids = np.array(Image.open(g["inst"]), np.int32)
@@ -217,7 +253,8 @@ def build(paths, ds, workers, check_images=True, limit=None):
 
     images, anns = [], []
     per_class = {c: {"n_images": 0, "n_objects": 0, "max_objects_in_image": 0} for c in sp.classes}
-    tot = {"void": 0, "filled": 0, "deep": 0, "pixels": 0, "obj_on_bg": 0, "pieces": 0, "merged_pieces": 0}
+    tot = {"void": 0, "filled": 0, "deep": 0, "pixels": 0, "obj_on_bg": 0, "pieces": 0, "merged_pieces": 0,
+           "one_mask_fallback": 0, "background": 0}
     too_many = []
     for k, r in enumerate(results, start=1):
         images.append({"id": k, "file_name": sp.rel_image(r["id"]), "height": r["H"], "width": r["W"], "sid": r["id"]})
@@ -247,6 +284,8 @@ def build(paths, ds, workers, check_images=True, limit=None):
         stats["void_share_of_pixels"] = tot["void"] / tot["pixels"]
         stats["void_filled_share"] = tot["filled"] / tot["void"]
         stats["void_deep_share"] = tot["deep"] / tot["void"]
+    if ds == "pc59":
+        stats["background_share_of_pixels"] = tot["background"] / tot["pixels"]
     return coco, stats, results
 
 
@@ -299,14 +338,14 @@ def check_existing(paths, ds):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--paths", required=True)
-    ap.add_argument("--datasets", nargs="+", default=["cityscapes", "voc2012"])
+    ap.add_argument("--datasets", nargs="+", default=list(fc.MAIN_DATASETS), choices=list(fc.DATASETS))
     ap.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
     ap.add_argument("--check", action="store_true", help="only re-check existing COCO files")
     ap.add_argument("--force", action="store_true", help="rebuild even if the output is up to date")
     ap.add_argument("--limit", type=int, default=None, help="first N fit images only (testing)")
     ap.add_argument("--skip-image-check", action="store_true", help="do not open the images (local test without images)")
     args = ap.parse_args()
-    paths = fc.load_paths(args.paths)
+    paths = fc.load_paths(args.paths, args.datasets)
     for ds in args.datasets:
         if args.check:
             check_existing(paths, ds)
@@ -334,6 +373,11 @@ def main():
             fc.log(f"voc2012: void {100 * stats['void_share_of_pixels']:.2f}% of pixels; "
                    f"{100 * stats['void_filled_share']:.1f}% filled (<= {fc.VOID_FILL_PX} px), "
                    f"{100 * stats['void_deep_share']:.1f}% -> background")
+        if ds == "pc59":
+            t = stats["pixels"]
+            fc.log(f"pc59: background {100 * stats['background_share_of_pixels']:.1f}% of pixels (negative for every "
+                   f"query); thing pieces {t['pieces']} ({t['merged_pieces']} small ones merged), "
+                   f"{t['one_mask_fallback']} class-images fell back to one mask")
         if not args.skip_image_check:
             save_samples(paths, ds, coco, samples)
 

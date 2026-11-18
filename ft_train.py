@@ -83,13 +83,13 @@ def build_config(paths, ds, cfg, fit_limit=None, holdout_limit=None, epoch_cap=N
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--paths", required=True)
-    ap.add_argument("--dataset", required=True, choices=["voc2012", "cityscapes"])
+    ap.add_argument("--dataset", required=True, choices=list(fc.DATASETS))
     ap.add_argument("--cfg", required=True, choices=list(fc.FT_CONFIGS))
     ap.add_argument("--fit-limit", type=int, default=None)
     ap.add_argument("--holdout-limit", type=int, default=None)
     ap.add_argument("--epoch-cap", type=int, default=None)
     args = ap.parse_args()
-    paths = fc.load_paths(args.paths)
+    paths = fc.load_paths(args.paths, [args.dataset])
     ds, cfg = args.dataset, args.cfg
 
     import torch
